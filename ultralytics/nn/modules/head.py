@@ -77,6 +77,7 @@ class Detect(nn.Module):
 
     dynamic = False  # force grid reconstruction
     export = False  # export mode
+    export_raw = False  # export raw per-scale 4D (box, cls) tensors, skipping anchor generation and box decode (DLA)
     format = None  # export format
     max_det = 300  # max_det
     agnostic_nms = False
@@ -158,6 +159,8 @@ class Detect(nn.Module):
         self, x: list[torch.Tensor]
     ) -> dict[str, torch.Tensor] | torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Concatenates and returns predicted bounding boxes and class probabilities."""
+        if self.export_raw:
+            return self._forward_export_raw(x)
         preds = self.forward_head(x, **self.one2many)
         if self.end2end:
             x_detach = [xi.detach() for xi in x]
@@ -169,6 +172,24 @@ class Detect(nn.Module):
         if self.end2end:
             y = self.postprocess(y.permute(0, 2, 1))
         return y if self.export else (y, preds)
+
+    def _forward_export_raw(self, x: list[torch.Tensor]) -> tuple[torch.Tensor, ...]:
+        """Return per-scale raw 4D (box, cls) tensors for DLA export.
+
+        Skips anchor generation and box decode (dist2bbox), which flatten H,W into a single
+        anchor axis and are not representable as DLA layers. The DFL integral is applied here
+        via self.dfl.conv directly, split per side (dim=1) instead of self.dfl's own
+        reshape+transpose, so every op stays in native NCHW (DLA-representable) and each scale's
+        H,W stay separate instead of being merged into one flat axis across all scales.
+        """
+        outputs = []
+        for i in range(self.nl):
+            box = self.cv2[i](x[i])  # (b, 4*reg_max, h, w)
+            cls = self.cv3[i](x[i]).sigmoid()  # (b, nc, h, w)
+            if not isinstance(self.dfl, nn.Identity):
+                box = torch.cat([self.dfl.conv(c.softmax(1)) for c in box.split(self.dfl.c1, 1)], 1)  # (b, 4, h, w)
+            outputs.append(torch.cat((box, cls), 1))
+        return tuple(outputs)
 
     def _inference(self, x: dict[str, torch.Tensor]) -> torch.Tensor:
         """Decode predicted bounding boxes and class probabilities based on multiple-level feature maps.
