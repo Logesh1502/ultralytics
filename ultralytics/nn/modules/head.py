@@ -174,22 +174,16 @@ class Detect(nn.Module):
         return y if self.export else (y, preds)
 
     def _forward_export_raw(self, x: list[torch.Tensor]) -> tuple[torch.Tensor, ...]:
-        """Return per-scale raw 4D (box, cls) tensors for DLA export.
+        """Return per-scale raw 4D (box, cls) tensors for DLA export, with no postprocessing at all.
 
-        Skips anchor generation and box decode (dist2bbox), which flatten H,W into a single
-        anchor axis and are not representable as DLA layers. The DFL integral is applied here
-        via self.dfl.conv directly, split per side (dim=1) instead of self.dfl's own
-        reshape+transpose, so every op stays in native NCHW (DLA-representable) and each scale's
-        H,W stay separate instead of being merged into one flat axis across all scales.
+        Skips anchor generation, box decode (dist2bbox), the DFL softmax/integral, and the
+        classification sigmoid -- every one of those flattens H,W into a single anchor axis
+        and/or needs a Softmax layer DLA either can't run at all or can't run in INT8. Each
+        scale's raw conv outputs (box: 4*reg_max channels, cls: nc channels, both un-decoded
+        logits) are concatenated channel-wise and returned per scale, native NCHW throughout.
+        All postprocessing (DFL integral, sigmoid, anchor decode) moves to the SDK.
         """
-        outputs = []
-        for i in range(self.nl):
-            box = self.cv2[i](x[i])  # (b, 4*reg_max, h, w)
-            cls = self.cv3[i](x[i]).sigmoid()  # (b, nc, h, w)
-            if not isinstance(self.dfl, nn.Identity):
-                box = torch.cat([self.dfl.conv(c.softmax(1)) for c in box.split(self.dfl.c1, 1)], 1)  # (b, 4, h, w)
-            outputs.append(torch.cat((box, cls), 1))
-        return tuple(outputs)
+        return tuple(torch.cat((self.cv2[i](x[i]), self.cv3[i](x[i])), 1) for i in range(self.nl))
 
     def _inference(self, x: dict[str, torch.Tensor]) -> torch.Tensor:
         """Decode predicted bounding boxes and class probabilities based on multiple-level feature maps.
